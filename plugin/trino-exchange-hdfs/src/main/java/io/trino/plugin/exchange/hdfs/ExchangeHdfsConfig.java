@@ -26,6 +26,7 @@ import javax.validation.constraints.NotNull;
 
 import java.io.File;
 import java.util.List;
+import java.util.Optional;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;

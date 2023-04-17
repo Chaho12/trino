@@ -14,18 +14,29 @@
 package io.trino.plugin.exchange.hdfs;
 
 import com.google.inject.Binder;
+import com.google.inject.Module;
+import com.google.inject.Provides;
 import com.google.inject.Scopes;
+import com.google.inject.Singleton;
 import io.airlift.configuration.AbstractConfigurationAwareModule;
+import io.trino.hdfs.HdfsConfigurationInitializer;
+import io.trino.hdfs.authentication.ForHdfs;
+import io.trino.hdfs.authentication.HadoopAuthentication;
+import io.trino.hdfs.authentication.HdfsAuthenticationConfig;
+import io.trino.hdfs.authentication.HdfsKerberosConfig;
+import io.trino.plugin.base.authentication.KerberosConfiguration;
 import io.trino.plugin.exchange.filesystem.FileSystemExchangeConfig;
 import io.trino.plugin.exchange.filesystem.FileSystemExchangeManager;
 import io.trino.plugin.exchange.filesystem.FileSystemExchangeStats;
 import io.trino.plugin.exchange.filesystem.FileSystemExchangeStorage;
 import io.trino.spi.TrinoException;
 
+import javax.inject.Inject;
 import java.net.URI;
 import java.util.List;
 
 import static io.airlift.configuration.ConfigBinder.configBinder;
+import static io.trino.hdfs.authentication.AuthenticationModules.createCachingKerberosHadoopAuthentication;
 import static io.trino.spi.StandardErrorCode.CONFIGURATION_INVALID;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static java.lang.String.format;
@@ -51,10 +62,41 @@ public class HdfsExchangeModule
         if (scheme.equalsIgnoreCase("hdfs")) {
             binder.bind(FileSystemExchangeStorage.class).to(HadoopFileSystemExchangeStorage.class).in(Scopes.SINGLETON);
             configBinder(binder).bindConfig(ExchangeHdfsConfig.class);
+
+            // re-use hdfs authentication config
+            if(buildConfigObject(HdfsAuthenticationConfig.class).getHdfsAuthenticationType() == HdfsAuthenticationConfig.HdfsAuthenticationType.KERBEROS) {
+                install(new KerberosHdfsExchangeAuthenticationModule());
+            }
         }
         else {
             binder.addError(new TrinoException(NOT_SUPPORTED,
                     format("Scheme %s is not supported as exchange spooling storage in exchange manager type %s", scheme, HdfsExchangeManagerFactory.NAME)));
+        }
+    }
+
+    public static class KerberosHdfsExchangeAuthenticationModule
+            implements Module
+    {
+
+        @Override
+        public void configure(Binder binder)
+        {
+            binder.bind(FileSystemExchangeStorage.class).to(HadoopFileSystemKerberosExchangeStorage.class).in(Scopes.SINGLETON);
+            configBinder(binder).bindConfig(ExchangeHdfsConfig.class);
+        }
+
+        @Inject
+        @Provides
+        @Singleton
+        @ForHdfs
+        HadoopAuthentication createHadoopAuthentication(HdfsKerberosConfig config, HdfsConfigurationInitializer updater)
+        {
+            String principal = config.getHdfsTrinoPrincipal();
+            KerberosConfiguration.Builder builder = new KerberosConfiguration.Builder()
+                    .withKerberosPrincipal(principal);
+            config.getHdfsTrinoKeytab().ifPresent(builder::withKeytabLocation);
+            config.getHdfsTrinoCredentialCacheLocation().ifPresent(builder::withCredentialCacheLocation);
+            return createCachingKerberosHadoopAuthentication(builder.build(), updater);
         }
     }
 }
