@@ -212,6 +212,7 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.expressions.Term;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.metrics.CommitMetricsResult;
 import org.apache.iceberg.metrics.CommitReport;
 import org.apache.iceberg.metrics.MetricsReporters;
@@ -258,6 +259,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -2252,15 +2254,7 @@ public class IcebergMetadata
                 executeRollbackToSnapshot(session, executeHandle);
                 return ImmutableMap.of();
             case EXPIRE_SNAPSHOTS:
-                IcebergExpireSnapshotsHandle icebergExpireSnapshotsHandle = (IcebergExpireSnapshotsHandle) executeHandle.procedureHandle();
-                executeExpireSnapshots(
-                        session,
-                        executeHandle.schemaTableName(),
-                        icebergExpireSnapshotsHandle.retentionThreshold(),
-                        getExpireSnapshotMinRetention(session),
-                        icebergExpireSnapshotsHandle.retainLast(),
-                        icebergExpireSnapshotsHandle.cleanExpiredMetadata());
-                return ImmutableMap.of();
+                return executeExpireSnapshots(session, executeHandle);
             case REMOVE_ORPHAN_FILES:
                 return executeRemoveOrphanFiles(session, executeHandle);
             case ADD_FILES:
@@ -2464,6 +2458,25 @@ public class IcebergMetadata
         }
     }
 
+    private Map<String, Long> executeExpireSnapshots(ConnectorSession session, IcebergTableExecuteHandle executeHandle)
+    {
+        IcebergExpireSnapshotsHandle expireSnapshotsHandle = (IcebergExpireSnapshotsHandle) executeHandle.procedureHandle();
+        SchemaTableName schemaTableName = executeHandle.schemaTableName();
+
+        BaseTable table = catalog.loadTable(session, schemaTableName);
+        Duration retention = requireNonNull(expireSnapshotsHandle.retentionThreshold(), "retention is null");
+        validateTableExecuteParameters(
+                table,
+                schemaTableName,
+                EXPIRE_SNAPSHOTS.name(),
+                retention,
+                getExpireSnapshotMinRetention(session),
+                IcebergConfig.EXPIRE_SNAPSHOTS_MIN_RETENTION,
+                IcebergSessionProperties.EXPIRE_SNAPSHOTS_MIN_RETENTION);
+
+        return doExpireSnapshots(session, schemaTableName, table, retention, expireSnapshotsHandle.retainLast(), expireSnapshotsHandle.cleanExpiredMetadata());
+    }
+
     private void executeExpireSnapshots(
             ConnectorSession session,
             SchemaTableName schemaTableName,
@@ -2483,6 +2496,23 @@ public class IcebergMetadata
                 IcebergConfig.EXPIRE_SNAPSHOTS_MIN_RETENTION,
                 IcebergSessionProperties.EXPIRE_SNAPSHOTS_MIN_RETENTION);
 
+        doExpireSnapshots(session, schemaTableName, table, retention, retainLast, cleanExpiredMetadata);
+    }
+
+    private Map<String, Long> doExpireSnapshots(
+            ConnectorSession session,
+            SchemaTableName schemaTableName,
+            BaseTable table,
+            Duration retention,
+            int retainLast,
+            boolean cleanExpiredMetadata)
+    {
+        AtomicLong deletedDataFilesCount = new AtomicLong(0);
+        AtomicLong deletedManifestsCount = new AtomicLong(0);
+        AtomicLong deletedManifestListsCount = new AtomicLong(0);
+        AtomicLong deletedStatisticsFilesCount = new AtomicLong(0);
+
+        FileIO io = table.io();
         // ForwardingFileIo handles bulk operations so no separate function implementation is needed
         try {
             table.expireSnapshots()
@@ -2490,10 +2520,50 @@ public class IcebergMetadata
                     .retainLast(retainLast)
                     .cleanExpiredMetadata(cleanExpiredMetadata)
                     .planWith(icebergScanExecutor)
+                    .deleteWith(path -> {
+                        io.deleteFile(path);
+                        countExpiredFile(path, deletedDataFilesCount, deletedManifestsCount, deletedManifestListsCount, deletedStatisticsFilesCount);
+                    })
                     .commit();
         }
         catch (NotFoundException e) {
             throw new TrinoException(ICEBERG_INVALID_METADATA, e);
+        }
+
+        log.info("expire_snapshots for table %s deleted %d data files, %d manifests, %d manifest lists, %d statistics files",
+                schemaTableName,
+                deletedDataFilesCount.get(),
+                deletedManifestsCount.get(),
+                deletedManifestListsCount.get(),
+                deletedStatisticsFilesCount.get());
+        return ImmutableMap.of(
+                "deleted_data_files_count", deletedDataFilesCount.get(),
+                "deleted_manifests_count", deletedManifestsCount.get(),
+                "deleted_manifest_lists_count", deletedManifestListsCount.get(),
+                "deleted_statistics_files_count", deletedStatisticsFilesCount.get());
+    }
+
+    private static void countExpiredFile(
+            String path,
+            AtomicLong deletedDataFilesCount,
+            AtomicLong deletedManifestsCount,
+            AtomicLong deletedManifestListsCount,
+            AtomicLong deletedStatisticsFilesCount)
+    {
+        String name = fileName(path);
+        if (name.endsWith(".avro")) {
+            if (name.startsWith("snap-")) {
+                deletedManifestListsCount.incrementAndGet();
+            }
+            else {
+                deletedManifestsCount.incrementAndGet();
+            }
+        }
+        else if (name.endsWith(".stats") || name.endsWith(".puffin")) {
+            deletedStatisticsFilesCount.incrementAndGet();
+        }
+        else {
+            deletedDataFilesCount.incrementAndGet();
         }
     }
 

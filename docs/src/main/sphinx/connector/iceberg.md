@@ -950,6 +950,33 @@ with the `retention_threshold` parameter.
 ALTER TABLE test_table EXECUTE expire_snapshots(retention_threshold => '7d');
 ```
 
+```text
+          metric_name           | metric_value
+--------------------------------+--------------
+ deleted_data_files_count       |            5
+ deleted_manifests_count        |            3
+ deleted_manifest_lists_count   |            2
+ deleted_statistics_files_count |            0
+```
+
+The output of the query has the following metrics:
+
+:::{list-table} Output
+:widths: 40, 60
+:header-rows: 1
+
+* - Property name
+  - Description
+* - `deleted_data_files_count`
+  - The count of data files deleted by expire_snapshots.
+* - `deleted_manifests_count`
+  - The count of manifest files deleted by expire_snapshots.
+* - `deleted_manifest_lists_count`
+  - The count of manifest list files deleted by expire_snapshots.
+* - `deleted_statistics_files_count`
+  - The count of statistics files deleted by expire_snapshots.
+:::
+
 The value for `retention_threshold` must be higher than or equal to
 `iceberg.expire-snapshots.min-retention` in the catalog, otherwise the
 procedure fails with a similar message: `Retention specified (1.00d) is shorter
